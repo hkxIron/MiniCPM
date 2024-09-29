@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 import json
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import torch
 import transformers
 from torch.utils.data import Dataset
 from transformers import (AutoModelForCausalLM, AutoTokenizer, Trainer,
-                          TrainingArguments,BitsAndBytesConfig)
+                          TrainingArguments, BitsAndBytesConfig, BatchEncoding, PreTrainedTokenizer,
+                          default_data_collator)
+from transformers.utils import PaddingStrategy
 
 
 @dataclass
@@ -41,8 +43,10 @@ class TrainingArguments(transformers.TrainingArguments):
     qlora: bool = field(default=False)
 
 
-class SupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning."""
+class SupervisedDataset(torch.utils.data.Dataset):
+    """Dataset for supervised fine-tuning.
+    注意，并不是hf的Dataset
+    """
     
     def __init__(
         self,
@@ -53,70 +57,99 @@ class SupervisedDataset(Dataset):
         assistant_tokens='<AI>',
     ):
         super(SupervisedDataset, self).__init__()
-        self.data = json.load(open(data_path))
+        data_list = []
+        with open(data_path, "r") as fr:
+            for line in fr.readlines():
+                data_list.append(json.loads(line))
+        self.data = data_list
+        print(f"data len:{len(self.data)}")
         self.tokenizer = tokenizer
         self.model_max_length = model_max_length
         self.user_tokens = self.tokenizer.encode(user_tokens) #针对不同模型，都可以对应到<用户>的id
         self.assistant_tokens = self.tokenizer.encode(assistant_tokens) #针对不同模型，都可以对应到<AI>的id
         self.ignore_index = -100
-        item = self.preprocessing(self.data[0])
-        print("input:", self.tokenizer.decode(item["input_ids"]))
-        labels = []
-        for id_ in item["label_ids"]:
-            if id_ == -100:
-                continue
-            labels.append(id_)
-        print("label:", self.tokenizer.decode(labels))
+        item_dict = self.convert_to_input_label_ids(self.data[0])
+        print("input:", self.tokenizer.decode(item_dict["input_ids"]))
+        # labels = []
+        # for id_ in item_dict["label_ids"]:
+        #     if id_ == -100:
+        #         continue
+        #     labels.append(id_)
+        # print("label:", self.tokenizer.decode(labels))
 
     def __len__(self):
         return len(self.data)
-
-    def preprocessing(self, example):
+    
+    def _get_ids_from_messages_format(self, example:Dict[str, str]):
         input_ids = [self.tokenizer.bos_token_id]
         label_ids = [self.ignore_index]
-
         for message in example["messages"]:
             role = message["role"]
             content = message["content"]
             content_ids = self.tokenizer.encode(content, add_special_tokens=False)
 
-            if role == "user":
+            if role == "user": # user是用户输入，不需要计算loss
                 input_ids += self.user_tokens + content_ids
-                label_ids += [self.ignore_index] * len(self.user_tokens) + [
-                    self.ignore_index
-                ] * len(content_ids)
-            else:
+                label_ids += [self.ignore_index] * len(self.user_tokens) + [ self.ignore_index ] * len(content_ids)
+            else: # assistant是llm的输出，需要计算loss
                 input_ids += self.assistant_tokens + content_ids
-                label_ids += (
-                    [self.ignore_index] * len(self.assistant_tokens)
-                    + content_ids
-                )
+                label_ids += [self.ignore_index] * len(self.assistant_tokens) + content_ids
+        return input_ids, label_ids
+    
+    def _get_ids_from_prompt_input_format(self, example:Dict[str, str]):
+        input_ids = [self.tokenizer.bos_token_id]
+        label_ids = [self.ignore_index]
+        
+        prompt_text = example['prompt']
+        input_text = example['input']
+        output_text = example['output']
+         
+        prompt_input_ids = self.tokenizer.encode(prompt_text+input_text, add_special_tokens=False)
+        input_ids += prompt_input_ids
+        label_ids += [self.ignore_index] * len(prompt_input_ids)
+        
+        output_ids = self.tokenizer.encode(output_text, add_special_tokens=False)
+        input_ids+=output_ids
+        label_ids+=output_ids
+        return input_ids, label_ids
+         
+
+    def convert_to_input_label_ids(self, example:Dict[str, str], pad_to_max_len=True)->Dict[str, List[int]]:
+        if "messages" in example:
+            input_ids, label_ids = self._get_ids_from_messages_format(example)
+        else:
+            #print(example)
+            input_ids, label_ids = self._get_ids_from_prompt_input_format(example) 
 
         input_ids.append(self.tokenizer.eos_token_id)
         label_ids.append(self.tokenizer.eos_token_id)
+        
         # truncate to max len
         input_ids = input_ids[: self.model_max_length]
         label_ids = label_ids[: self.model_max_length]
         attention_mask = [1] * len(input_ids)
-        # pad to max len
-        input_ids += [self.tokenizer.eos_token_id] * (
-            self.model_max_length - len(input_ids)
-        )
-        label_ids += [self.ignore_index] * (self.model_max_length - len(label_ids))
-        attention_mask += [0] * (self.model_max_length - len(attention_mask))
+
+        if pad_to_max_len:
+            # pad to max len
+            # 如果len是负数，追加的list就是空列表
+            input_ids += [self.tokenizer.eos_token_id] * (self.model_max_length - len(input_ids)) # padding的部分为eos_token
+            label_ids += [self.ignore_index] * (self.model_max_length - len(label_ids)) # padding的部分为ignore_index=-100
+            attention_mask += [0] * (self.model_max_length - len(attention_mask)) # padding的部分为0
+
         # convert to pt tensor
         input_ids = torch.LongTensor(input_ids)
         label_ids = torch.LongTensor(label_ids)
         attention_mask = torch.LongTensor(attention_mask)
+
         return {
             "input_ids": input_ids,
-            "label_ids": label_ids,
+            #"label_ids": label_ids,
+            "labels": label_ids,
             "attention_mask": attention_mask,
         }
 
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        return self.preprocessing(self.data[idx])
-
+        return self.convert_to_input_label_ids(self.data[idx], pad_to_max_len=True)
 
 def load_model_and_tokenizer(
     model_path: str,
@@ -140,8 +173,8 @@ def load_model_and_tokenizer(
     if qlora:
         assert use_lora, "use_lora must be True when use_qlora is True"
         quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,  # 是否进行4bit量化
-            load_in_8bit=False,  # 是否进行8bit量化
+            load_in_4bit=True,  # 是否进行4bit量化, 需要gpu
+            load_in_8bit=False,  # 是否进行8bit量化, 需要gpu
             bnb_4bit_compute_dtype=torch.float16,  # 计算精度设置
             bnb_4bit_quant_storage=torch.uint8,  # 量化权重的储存格式
             bnb_4bit_quant_type="nf4",  # 量化格式，这里用的是正太分布的int4
@@ -155,8 +188,7 @@ def load_model_and_tokenizer(
             model_path,
             torch_dtype=dtype,
             trust_remote_code=True,
-            quantization_config=quantization_config,
-
+            #quantization_config=quantization_config, # 量化需要gpu支持才行
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
@@ -183,12 +215,51 @@ def load_model_and_tokenizer(
 
     return model, tokenizer
 
+"""
+将多个input dict组成的list转换成一个dict,其中key不变，但value是多个原始数据组成的数组
+eg:
+input_dict_list:
+[
+    {
+    "input_ids":[1,2,3,7,8,9],
+    "label_ids":[-100,-100,-100,8,9,200],
+    "attention_mask":[1,1,1],
+    },
+   {
+    "input_ids":[1,2,3,7,8,9, 10, 11, 12],
+    "label_ids":[-100,-100,-100,8,9,10,11,12, 200],
+    "attention_mask":[1,1,1, 1,1,1],
+    },
+]
+
+collator会先按max_seq_len进行padding后，再进行组成batch
+BatchEncoding(
+    data={
+        "input_ids":[[1,2,3,7,8,9, 0,0,0],[1,2,3,7,8,9, 10, 11, 12]],
+        "label_ids":[[-100,-100,-100, 8,9,200], [-100, -100, -100, 8,9,10,11,12, 200]],
+        "attention_mask":[[1,1,1, 1,1,1,0,0,0], [1,1,1, 1,1,1,1,1,1]],
+    }
+)
+"""
+def get_collator(input_dict_list:List[Dict[str, list[int]]], max_seq_length:int, tokenizer: PreTrainedTokenizer)->BatchEncoding:
+    collator_data:BatchEncoding = tokenizer.pad(
+        input_dict_list,
+        padding= PaddingStrategy.MAX_LENGTH,
+        max_length=max_seq_length,
+        return_tensors="pt",
+    )
+    # collator:也可以完全自己计算，不需要使用tranformer的函数
+    #collator_data = default_data_collator(input_dict_list)
+    #default_data_collator()
+    print("collator_data:", collator_data)
+    print("collator_data input_ids:", collator_data['input_ids'])
+    print("collator_data input_ids shape:", collator_data['input_ids'].shape)
+    print("collator_data labels shape:", collator_data['labels'].shape)
+    return collator_data
 
 if __name__ == "__main__":
-    model_path = "/mnt/data/user/tc_agi/yh/models/MiniCPM"
-    parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments)
-    )
+    #model_path = "/mnt/data/user/tc_agi/yh/models/MiniCPM"
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     model, tokenizer = load_model_and_tokenizer(
         model_path=model_args.model_name_or_path,
@@ -216,8 +287,9 @@ if __name__ == "__main__":
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
+        data_collator=lambda x: get_collator(x, training_args.model_max_length, tokenizer)
     )
 
     trainer.train()
     # save the incremental PEFT weights, more details can be found in https://huggingface.co/blog/peft
-    # model.save_pretrained("output_dir") 
+    trainer.save_model("output_dir")
